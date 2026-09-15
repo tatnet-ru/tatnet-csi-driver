@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/container-storage-interface/spec v1.11.0
-	github.com/tatnet-ru/tatnet-go v0.1.0
+	github.com/tatnet-ru/tatnet-go v0.2.1
 	google.golang.org/grpc v1.71.0
 	google.golang.org/protobuf v1.36.5
 	k8s.io/klog/v2 v2.130.1
