@@ -1,0 +1,316 @@
+# Манифест CSI-драйвера блочных томов TatNet.
+#
+# Источник правды. Оркестратор держит его копию (internal/csi/render.go),
+# подставляет __ТОКЕНЫ__ и доставляет в кластер: inline-манифестом на бутстрапе
+# и server-side apply на каждом converge. Тест на стороне оркестратора сверяет
+# копию с этим файлом, чтобы они не разъехались.
+#
+# Свой неймспейс, не общий с local-path: два аддона, объявляющие один объект,
+# дрались бы за владение полями при каждом apply.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tatnet-csi
+  labels:
+    # node-плагину нужен privileged: он монтирует hostPath, работает с /dev и
+    # выполняет mount(2). Talos энфорсит baseline по умолчанию, и без этого
+    # DaemonSet не пройдёт admission вовсе.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tatnet-csi
+  namespace: tatnet-csi
+type: Opaque
+stringData:
+  api-base: "__API_BASE__"
+  project-id: "__PROJECT_ID__"
+  region-id: "__REGION_ID__"
+  k8s-cluster-id: "__K8S_CLUSTER_ID__"
+  api-key: "__API_KEY__"
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: block.csi.tatnet.ru
+spec:
+  # Том прикрепляется к машине гипервизором, а не монтируется по сети: без
+  # attachRequired kubelet пошёл бы монтировать устройство, которого на ноде
+  # ещё нет.
+  attachRequired: true
+  podInfoOnMount: false
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tatnet-csi-controller
+  namespace: tatnet-csi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tatnet-csi-node
+  namespace: tatnet-csi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tatnet-csi-controller
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Поды нужны external-resizer'у: по ним он понимает, что том ИСПОЛЬЗУЕТСЯ, и
+  # доводит расширение до файловой системы. Без этого права ресайзер молча
+  # крутится на «pods is forbidden», PVC остаётся в прежней ёмкости, и наружу
+  # это выглядит как «расширение не работает» без единой ошибки на PVC.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tatnet-csi-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tatnet-csi-controller
+subjects:
+  - kind: ServiceAccount
+    name: tatnet-csi-controller
+    namespace: tatnet-csi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tatnet-csi-controller
+  namespace: tatnet-csi
+  labels:
+    app: tatnet-csi-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tatnet-csi-controller
+  template:
+    metadata:
+      labels:
+        app: tatnet-csi-controller
+    spec:
+      serviceAccountName: tatnet-csi-controller__HOST_ALIASES__
+      priorityClassName: system-cluster-critical
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: csi-driver
+          image: "__IMAGE__"
+          args: ["-mode=controller", "-endpoint=unix:///csi/csi.sock", "-v=2"]
+          env:
+            - name: TATNET_API_BASE
+              valueFrom: { secretKeyRef: { name: tatnet-csi, key: api-base } }
+            - name: TATNET_PROJECT_ID
+              valueFrom: { secretKeyRef: { name: tatnet-csi, key: project-id } }
+            - name: TATNET_REGION_ID
+              valueFrom: { secretKeyRef: { name: tatnet-csi, key: region-id } }
+            - name: TATNET_K8S_CLUSTER_ID
+              valueFrom: { secretKeyRef: { name: tatnet-csi, key: k8s-cluster-id } }
+            - name: TATNET_API_KEY
+              valueFrom: { secretKeyRef: { name: tatnet-csi, key: api-key } }
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { memory: 256Mi }
+        - name: csi-provisioner
+          image: "__PROVISIONER_IMAGE__"
+          # Топология обязательна: том живёт на SAN своего региона, и нода
+          # другого региона его не откроет. Без --feature-gates=Topology и
+          # WaitForFirstConsumer провижинер создал бы том раньше, чем узнал,
+          # куда встанет под.
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--feature-gates=Topology=true"
+            - "--immediate-topology=false"
+            - "--leader-election"
+            - "--leader-election-namespace=tatnet-csi"
+            - "--default-fstype=ext4"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+        - name: csi-attacher
+          image: "__ATTACHER_IMAGE__"
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--leader-election"
+            - "--leader-election-namespace=tatnet-csi"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+        - name: csi-resizer
+          image: "__RESIZER_IMAGE__"
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--leader-election"
+            - "--leader-election-namespace=tatnet-csi"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tatnet-csi-node
+  namespace: tatnet-csi
+  labels:
+    app: tatnet-csi-node
+spec:
+  selector:
+    matchLabels:
+      app: tatnet-csi-node
+  template:
+    metadata:
+      labels:
+        app: tatnet-csi-node
+    spec:
+      serviceAccountName: tatnet-csi-node
+      priorityClassName: system-node-critical
+      hostNetwork: false
+      # На КАЖДОЙ ноде без исключений: под, приземлившийся туда, где плагина
+      # нет, не сможет смонтировать том, и отказ придёт в момент запуска.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: csi-driver
+          image: "__IMAGE__"
+          args:
+            - "-mode=node"
+            - "-endpoint=unix:///csi/csi.sock"
+            - "-v=2"
+          env:
+            # Нода зовётся своим адресом, а машину за ним резолвит контроллер
+            # запросом к платформе. Идентичность машины на ноду не доставляется
+            # вовсе: общего имени у ноды Kubernetes и машины TatNet нет, а файл
+            # в машинном конфиге Talos не принимает в immediate-режиме — и
+            # попытка доставить его так роняет конвергенцию конфига живой ноды,
+            # то есть перестают ехать и все остальные аддоны.
+            - name: TATNET_NODE_IP
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+            # Регион нужен и НОДЕ: из него она объявляет свою топологию
+            # (topology.block.csi.tatnet.ru/region), а планировщик по этой
+            # метке решает, где под вообще может встать. Без региона метка
+            # пустая, требование PV не совпадает ни с одной нодой, и под висит
+            # в Pending с «node affinity doesn't match».
+            - name: TATNET_REGION_ID
+              valueFrom: { secretKeyRef: { name: tatnet-csi, key: region-id } }
+          securityContext:
+            # Привилегии нужны по существу: mount(2), доступ к /dev и
+            # bidirectional-распространение монтирований в неймспейс пода.
+            privileged: true
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: dev-dir
+              mountPath: /dev
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+        - name: node-driver-registrar
+          image: "__REGISTRAR_IMAGE__"
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/block.csi.tatnet.ru/csi.sock"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/block.csi.tatnet.ru
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: tatnet-block__DEFAULT__
+provisioner: block.csi.tatnet.ru
+# WaitForFirstConsumer несущий, а не предпочтение: том привязан к региону, и
+# создать его надо после того, как планировщик выбрал ноду.
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  csi.storage.k8s.io/fstype: ext4
