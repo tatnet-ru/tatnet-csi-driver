@@ -91,9 +91,10 @@ stale requests for another node. Provider errors retain their error detail.
 
 The agent reserves 32 Q35 PCIe root ports before boot: 25 data volumes plus
 boot-time devices. Without a reserve, the second hotplug fails with
-`No more available PCI slots`. Existing nodes need a planned cold restart
-with expanded persistent topology, or replacement through a drained node
-pool. Root ports cannot be added live. Do not automatically reboot customer
+`No more available PCI slots`. On an explicit stop/start, the updated agent expands the persistent PCIe
+topology of an existing stopped Q35 VM before boot. A guest reboot does not
+rebuild PCI topology. Existing nodes therefore need planned stop/start
+(or replacement through a drained node pool). Root ports cannot be added live. Do not automatically reboot customer
 nodes or change existing virtio disks/serials to recover mounts.
 
 References: [CSI lifecycle](https://github.com/container-storage-interface/spec/blob/master/spec.md#controllerpublishvolume),
