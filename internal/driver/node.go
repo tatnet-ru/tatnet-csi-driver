@@ -54,7 +54,6 @@ func (s *nodeServer) NodeGetCapabilities(context.Context, *csi.NodeGetCapabiliti
 	caps := []csi.NodeServiceCapability_RPC_Type{
 		csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
 		csi.NodeServiceCapability_RPC_EXPAND_VOLUME,
-		csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 	}
 	out := make([]*csi.NodeServiceCapability, 0, len(caps))
 	for _, c := range caps {
@@ -84,6 +83,9 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	}
 
 	serial := req.GetVolumeContext()[ContextSerial]
+	if published := req.GetPublishContext()[ContextSerial]; published != "" {
+		serial = published
+	}
 	if serial == "" {
 		// Серийник кладёт контроллер в volume_context при создании тома. Его
 		// отсутствие означает, что PV сделан не нами или контекст потерян —
@@ -93,8 +95,7 @@ func (s *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolu
 	}
 	device, err := FindDevice(serial)
 	if err != nil {
-		// NotFound, а не Internal: external-attacher ждёт, пока устройство
-		// доедет, и ретраит. Горячее подключение занимает секунды.
+		// Kubelet retries staging while the guest discovers the device.
 		return nil, status.Errorf(codes.NotFound, "устройство тома: %v", err)
 	}
 

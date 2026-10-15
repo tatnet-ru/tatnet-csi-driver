@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -38,17 +39,21 @@ type fakeAPI struct {
 	lastCreate string
 	// nodes — связка «адрес ноды → машина», которую контроллер спрашивает у
 	// платформы вместо того, чтобы держать снимок.
-	nodes       []api.V1K8sNode
-	nodeLookups int
-	attach      int
-	detach      int
-	srv         *httptest.Server
+	nodes        []api.V1K8sNode
+	nodeLookups  int
+	attach       int
+	detach       int
+	srv          *httptest.Server
+	attachStatus string
+	delayDetach  bool
+	onGet        func(*api.V1Volume)
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
 	t.Helper()
 	f := &fakeAPI{
-		volumes: map[string]*api.V1Volume{},
+		attachStatus: "attached",
+		volumes:      map[string]*api.V1Volume{},
 		nodes: []api.V1K8sNode{
 			{VmId: ptr("vm-1"), Address: ptr(nodeIP1), Role: "worker", Status: "ready"},
 			{VmId: ptr("vm-2"), Address: ptr(nodeIP2), Role: "worker", Status: "ready"},
@@ -112,12 +117,16 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 			}
 			json.NewDecoder(r.Body).Decode(&body)
 			f.attach++
-			v.Attachment = &api.V1VolumeAttachment{VmId: body.VMID, Status: "attaching"}
+			v.Attachment = &api.V1VolumeAttachment{VmId: body.VMID, Status: f.attachStatus}
 			jsonHdr(w)
 			json.NewEncoder(w).Encode(v)
 		case "detach":
 			f.detach++
-			v.Attachment = nil
+			if f.delayDetach {
+				v.Attachment.Status = "detaching"
+			} else {
+				v.Attachment = nil
+			}
 			w.WriteHeader(http.StatusOK)
 		case "":
 			switch r.Method {
@@ -133,6 +142,9 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 				jsonHdr(w)
 				json.NewEncoder(w).Encode(v)
 			default:
+				if f.onGet != nil {
+					f.onGet(v)
+				}
 				jsonHdr(w)
 				json.NewEncoder(w).Encode(v)
 			}
@@ -150,8 +162,9 @@ func newController(t *testing.T, f *fakeAPI) *controllerServer {
 		t.Fatalf("клиент tatnet: %v", err)
 	}
 	return &controllerServer{
-		cfg: Config{RegionID: testRegion, K8sClusterID: testK8sCluster},
-		api: api,
+		pollInterval: time.Millisecond,
+		cfg:          Config{RegionID: testRegion, K8sClusterID: testK8sCluster},
+		api:          api,
 	}
 }
 

@@ -54,9 +54,11 @@ func NewClient(base, projectID, k8sClusterID, key string) (*Client, error) {
 
 // Attachment — текущее прикрепление тома, или nil.
 type Attachment struct {
-	VMID      string
-	Status    string
-	TargetDev string
+	VMID         string
+	Status       string
+	TargetDev    string
+	DesiredState string
+	ErrorDetail  string
 }
 
 // Volume — то, что нужно драйверу. Поля заполняются из сгенерированных
@@ -109,9 +111,11 @@ func toVolume(v *api.V1Volume) *Volume {
 	}
 	if v.Attachment != nil {
 		out.Attachment = &Attachment{
-			VMID:      v.Attachment.VmId,
-			Status:    v.Attachment.Status,
-			TargetDev: deref(v.Attachment.TargetDev),
+			VMID:         v.Attachment.VmId,
+			Status:       v.Attachment.Status,
+			TargetDev:    deref(v.Attachment.TargetDev),
+			DesiredState: deref(v.Attachment.DesiredState),
+			ErrorDetail:  deref(v.Attachment.ErrorDetail),
 		}
 	}
 	return out
