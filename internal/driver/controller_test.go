@@ -418,3 +418,119 @@ func TestControllerPublish_ResolvesNodeEveryTime(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+func TestPublishWaitsForObservedAttachAndResumesAfterDeadline(t *testing.T) {
+	f := newFakeAPI(t)
+	c := newController(t, f)
+	f.attachStatus = "attaching"
+	f.volumes[testVolID] = &api.V1Volume{Id: testVolID, Status: "ready", DeviceSerial: testSerial}
+	req := &csi.ControllerPublishVolumeRequest{VolumeId: testVolID, NodeId: nodeIP1, VolumeCapability: mountCaps()[0]}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := c.ControllerPublishVolume(ctx, req); status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("pending attach returned %v", err)
+	}
+	if f.attach != 1 {
+		t.Fatalf("attach calls=%d", f.attach)
+	}
+	reads := 0
+	f.onGet = func(v *api.V1Volume) {
+		reads++
+		if reads >= 3 {
+			v.Attachment.Status = "attached"
+		}
+	}
+	out, err := c.ControllerPublishVolume(context.Background(), req)
+	if err != nil || out.GetPublishContext()[ContextSerial] != testSerial {
+		t.Fatalf("resume: %v %v", out, err)
+	}
+	if f.attach != 1 || reads < 3 {
+		t.Fatalf("attach=%d reads=%d", f.attach, reads)
+	}
+}
+
+func TestPublishReportsProviderErrorAndRetriesSameVM(t *testing.T) {
+	f := newFakeAPI(t)
+	c := newController(t, f)
+	f.attachStatus = "attaching"
+	f.volumes[testVolID] = &api.V1Volume{Id: testVolID, Status: "ready", DeviceSerial: testSerial}
+	req := &csi.ControllerPublishVolumeRequest{VolumeId: testVolID, NodeId: nodeIP1, VolumeCapability: mountCaps()[0]}
+	f.onGet = func(v *api.V1Volume) {
+		if v.Attachment != nil {
+			v.Attachment.Status = "error"
+			v.Attachment.ErrorDetail = ptr("No more available PCI slots")
+		}
+	}
+	_, err := c.ControllerPublishVolume(context.Background(), req)
+	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), "No more available PCI slots") {
+		t.Fatalf("lost provider failure: %v", err)
+	}
+	f.onGet = nil
+	f.attachStatus = "attached"
+	if _, err = c.ControllerPublishVolume(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if f.attach != 2 || f.detach != 0 {
+		t.Fatalf("retry must attach same VM without detach: attach=%d detach=%d", f.attach, f.detach)
+	}
+}
+
+func TestPublishNeverReversesDetachIntent(t *testing.T) {
+	f := newFakeAPI(t)
+	c := newController(t, f)
+	f.volumes[testVolID] = &api.V1Volume{Id: testVolID, Status: "ready", Attachment: &api.V1VolumeAttachment{VmId: "vm-1", Status: "error", DesiredState: ptr("absent")}}
+	_, err := c.ControllerPublishVolume(context.Background(), &csi.ControllerPublishVolumeRequest{VolumeId: testVolID, NodeId: nodeIP1, VolumeCapability: mountCaps()[0]})
+	if status.Code(err) != codes.Aborted || f.attach != 0 {
+		t.Fatalf("unsafe retry: %v attach=%d", err, f.attach)
+	}
+}
+
+func TestUnpublishWaitsForDetachAndIgnoresStaleNode(t *testing.T) {
+	f := newFakeAPI(t)
+	c := newController(t, f)
+	f.delayDetach = true
+	f.volumes[testVolID] = &api.V1Volume{Id: testVolID, Status: "ready", Attachment: &api.V1VolumeAttachment{VmId: "vm-1", Status: "attached"}}
+	if _, err := c.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{VolumeId: testVolID, NodeId: nodeIP2}); err != nil {
+		t.Fatal(err)
+	}
+	if f.detach != 0 {
+		t.Fatal("stale node unplugged current owner")
+	}
+	reads := 0
+	f.onGet = func(v *api.V1Volume) {
+		if v.Attachment != nil && v.Attachment.Status == "detaching" {
+			reads++
+			if reads >= 3 {
+				v.Attachment = nil
+			}
+		}
+	}
+	if _, err := c.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{VolumeId: testVolID, NodeId: nodeIP1}); err != nil {
+		t.Fatal(err)
+	}
+	if reads < 3 || f.detach != 1 {
+		t.Fatalf("did not wait: reads=%d detach=%d", reads, f.detach)
+	}
+}
+
+func TestAttachDetachOverlapIsAborted(t *testing.T) {
+	c := newController(t, newFakeAPI(t))
+	c.startOperation(testVolID)
+	_, err := c.ControllerUnpublishVolume(context.Background(), &csi.ControllerUnpublishVolumeRequest{VolumeId: testVolID})
+	if status.Code(err) != codes.Aborted {
+		t.Fatalf("overlap=%v", err)
+	}
+}
+
+func TestNodeDoesNotAdvertiseUnimplementedStats(t *testing.T) {
+	n := newNodeServer(Config{NodeID: nodeIP1})
+	caps, err := n.NodeGetCapabilities(context.Background(), &csi.NodeGetCapabilitiesRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cap := range caps.Capabilities {
+		if cap.GetRpc().GetType() == csi.NodeServiceCapability_RPC_GET_VOLUME_STATS {
+			t.Fatal("unimplemented stats advertised")
+		}
+	}
+}
