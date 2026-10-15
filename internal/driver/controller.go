@@ -2,6 +2,8 @@ package driver
 
 import (
 	"context"
+	"sync"
+	"time"
 
 	csi "github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -23,8 +25,10 @@ const gibibyte = 1 << 30
 
 type controllerServer struct {
 	csi.UnimplementedControllerServer
-	cfg Config
-	api *tatnet.Client
+	cfg          Config
+	api          *tatnet.Client
+	operations   sync.Map
+	pollInterval time.Duration
 }
 
 func (s *controllerServer) ControllerGetCapabilities(context.Context, *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
@@ -121,6 +125,13 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 	if id == "" || nodeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id и node_id обязательны")
 	}
+	if err := validateCapabilities([]*csi.VolumeCapability{req.GetVolumeCapability()}); err != nil {
+		return nil, err
+	}
+	if !s.startOperation(id) {
+		return nil, status.Errorf(codes.Aborted, "операция с томом %s уже выполняется", id)
+	}
+	defer s.operations.Delete(id)
 
 	vmID, err := s.resolveNode(ctx, nodeID)
 	if err != nil {
@@ -141,20 +152,48 @@ func (s *controllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		return nil, status.Errorf(codes.Unavailable,
 			"том %s не готов (%s): %s", id, vol.Status, vol.ErrorDetail)
 	}
-	// Уже прикреплён к этой же машине — идемпотентный успех. К ДРУГОЙ —
-	// отказ: у тома не может быть двух прикреплений, и молча переехать значило
-	// бы выдернуть диск из-под работающего пода.
 	if a := vol.Attachment; a != nil {
-		if a.VMID == vmID {
+		if a.VMID != vmID {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"том %s уже прикреплён к машине %s", id, a.VMID)
+		}
+		if a.DesiredState == "absent" || a.Status == "detaching" {
+			return nil, status.Errorf(codes.Aborted, "том %s ещё открепляется", id)
+		}
+		if a.Status == "attached" {
 			return publishResponse(vol), nil
 		}
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"том %s уже прикреплён к машине %s", id, a.VMID)
 	}
 
-	vol, err = s.api.Attach(ctx, id, vmID)
+	// API accepts an asynchronous intent. Only submit when no operation is
+	// pending, or retry a failed attach to the SAME VM. Never detach to retry.
+	if vol.Attachment == nil || vol.Attachment.Status == "error" {
+		vol, err = s.api.Attach(ctx, id, vmID)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "прикрепление тома %s к %s: %v", id, vmID, err)
+		}
+	}
+	vol, err = s.waitVolume(ctx, id, func(v *tatnet.Volume) (bool, error) {
+		if v == nil {
+			return false, status.Errorf(codes.NotFound, "том %s исчез при прикреплении", id)
+		}
+		a := v.Attachment
+		if a == nil {
+			return false, nil
+		}
+		if a.VMID != vmID {
+			return false, status.Errorf(codes.FailedPrecondition, "том %s занят машиной %s", id, a.VMID)
+		}
+		if a.DesiredState == "absent" || a.Status == "detaching" {
+			return false, status.Errorf(codes.Aborted, "том %s открепляется", id)
+		}
+		if a.Status == "error" {
+			return false, status.Errorf(codes.Internal, "прикрепление тома %s: %s", id, a.ErrorDetail)
+		}
+		return a.Status == "attached", nil
+	})
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "прикрепление тома %s к %s: %v", id, vmID, err)
+		return nil, err
 	}
 	klog.InfoS("том прикреплён", "volume", id, "node", nodeID, "vm", vmID)
 	return publishResponse(vol), nil
@@ -176,11 +215,95 @@ func (s *controllerServer) ControllerUnpublishVolume(ctx context.Context, req *c
 	if id == "" {
 		return nil, status.Error(codes.InvalidArgument, "volume_id обязателен")
 	}
+	if !s.startOperation(id) {
+		return nil, status.Errorf(codes.Aborted, "операция с томом %s уже выполняется", id)
+	}
+	defer s.operations.Delete(id)
+	vol, err := s.api.Get(ctx, id)
+	if tatnet.IsNotFound(err) {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "чтение тома %s: %v", id, err)
+	}
+	if vol.Attachment == nil {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+	if req.GetNodeId() != "" {
+		vmID, err := s.resolveNode(ctx, req.GetNodeId())
+		if err != nil {
+			return nil, err
+		}
+		// A stale unpublish for another node must never unplug the new owner.
+		if vol.Attachment.VMID != vmID {
+			return &csi.ControllerUnpublishVolumeResponse{}, nil
+		}
+	}
 	if err := s.api.Detach(ctx, id); err != nil {
 		return nil, status.Errorf(codes.Internal, "открепление тома %s: %v", id, err)
 	}
+	if _, err := s.waitVolume(ctx, id, func(v *tatnet.Volume) (bool, error) {
+		if v == nil || v.Attachment == nil {
+			return true, nil
+		}
+		if v.Attachment.VMID != vol.Attachment.VMID {
+			return false, status.Errorf(codes.Aborted, "прикрепление тома %s изменилось", id)
+		}
+		if v.Attachment.Status == "error" {
+			return false, status.Errorf(codes.Internal, "открепление тома %s: %s", id, v.Attachment.ErrorDetail)
+		}
+		return false, nil
+	}); err != nil {
+		return nil, err
+	}
 	klog.InfoS("том откреплён", "volume", id, "node", req.GetNodeId())
 	return &csi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+func (s *controllerServer) startOperation(id string) bool {
+	_, loaded := s.operations.LoadOrStore(id, struct{}{})
+	return !loaded
+}
+
+// waitVolume observes provider state, rather than treating an accepted
+// asynchronous request as completion. Cancellation does not undo the intent:
+// the next CSI call observes/resumes it, as in DO and AWS CSI drivers.
+func (s *controllerServer) waitVolume(ctx context.Context, id string, ready func(*tatnet.Volume) (bool, error)) (*tatnet.Volume, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	interval := s.pollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		v, err := s.api.Get(ctx, id)
+		if tatnet.IsNotFound(err) {
+			v, err = nil, nil
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, status.FromContextError(ctx.Err()).Err()
+			}
+			return nil, status.Errorf(codes.Unavailable, "состояние тома %s: %v", id, err)
+		}
+		done, err := ready(v)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return v, nil
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, status.FromContextError(ctx.Err()).Err()
+		case <-timer.C:
+		}
+	}
 }
 
 // ControllerExpandVolume растит сам том. Файловую систему растит нода — отсюда
