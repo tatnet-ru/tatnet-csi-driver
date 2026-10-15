@@ -79,3 +79,24 @@ docker build -t <registry>/tatnet-csi-driver:<tag> .
 ## Лицензия
 
 [Apache-2.0](LICENSE).
+
+## Attachment completion and Q35 hotplug
+
+`ControllerPublishVolume` waits for an observed `attached` state; an accepted
+API request or an `attaching` row is not success. Timeouts leave the operation
+intact for the next CSI retry. Failed attaches may retry only on the same VM,
+without detaching the disk. Pending/failed detaches keep reserving the volume.
+`ControllerUnpublishVolume` waits for the attachment to disappear and ignores
+stale requests for another node. Provider errors retain their error detail.
+
+The agent reserves 32 Q35 PCIe root ports before boot: 25 data volumes plus
+boot-time devices. Without a reserve, the second hotplug fails with
+`No more available PCI slots`. Existing nodes need a planned cold restart
+with expanded persistent topology, or replacement through a drained node
+pool. Root ports cannot be added live. Do not automatically reboot customer
+nodes or change existing virtio disks/serials to recover mounts.
+
+References: [CSI lifecycle](https://github.com/container-storage-interface/spec/blob/master/spec.md#controllerpublishvolume),
+[DigitalOcean action wait](https://github.com/digitalocean/csi-digitalocean/blob/master/driver/controller.go),
+[AWS attachment state wait](https://github.com/kubernetes-sigs/aws-ebs-csi-driver/blob/master/pkg/cloud/cloud.go),
+[libvirt PCI hotplug](https://libvirt.org/pci-hotplug.html).
