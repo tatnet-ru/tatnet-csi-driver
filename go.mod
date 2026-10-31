@@ -6,7 +6,7 @@ require (
 	github.com/container-storage-interface/spec v1.11.0
 	github.com/tatnet-ru/tatnet-go v0.13.4
 	google.golang.org/grpc v1.83.2
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/mount-utils v0.33.0
 	k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3
