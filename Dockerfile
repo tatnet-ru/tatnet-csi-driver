@@ -15,7 +15,7 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/tatnet-ru/tatnet-csi-dr
 # k8s.io/mount-utils вызывает их как внешние программы. Образ без них
 # поднимается и падает на первом же PVC, причём в момент монтирования, а не при
 # старте.
-FROM debian:bookworm-20260803-slim
+FROM debian:bookworm-20261027-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends e2fsprogs xfsprogs util-linux ca-certificates \
  && rm -rf /var/lib/apt/lists/*
