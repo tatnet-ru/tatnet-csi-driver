@@ -1,8 +1,8 @@
 # Пин до patch-версии, не rolling: официальный образ ставит GOTOOLCHAIN=local,
 # поэтому образ СТАРШЕ go.mod не подтягивает нужный тулчейн, а падает на
 # `go mod download` — ровно так этот Dockerfile и не собирался ни разу
-# (golang:1.24 против `go 1.25` в go.mod).
-FROM golang:1.27.0-bookworm AS build
+# (golang:1.27.3 против `go 1.25` в go.mod).
+FROM golang:1.27.3-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
