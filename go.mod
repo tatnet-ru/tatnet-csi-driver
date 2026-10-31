@@ -1,6 +1,6 @@
 module github.com/tatnet-ru/tatnet-csi-driver
 
-go 1.27.0
+go 1.27.3
 
 require (
 	github.com/container-storage-interface/spec v1.11.0
