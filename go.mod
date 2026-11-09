@@ -3,7 +3,7 @@ module github.com/tatnet-ru/tatnet-csi-driver
 go 1.27.3
 
 require (
-	github.com/container-storage-interface/spec v1.11.0
+	github.com/container-storage-interface/spec v1.13.0
 	github.com/tatnet-ru/tatnet-go v0.13.4
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
